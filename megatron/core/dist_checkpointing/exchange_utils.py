@@ -550,7 +550,6 @@ def exchange_loaded_tensors_broadcast(
                         all_loaded_tensors[shard_id] = batch_tensors[i].to(orig_device, non_blocking=True)
                 else:
                     all_loaded_tensors[shard_id] = batch_tensors[i].to(orig_device)
-            del batch_tensors[i]
         
         # Synchronize streams after D2H copies
         if streams:
