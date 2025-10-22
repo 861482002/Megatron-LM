@@ -441,6 +441,8 @@ def exchange_loaded_tensors_broadcast(
     For each rank for each loaded tensor do a broadcast to the whole group.
     A reasonable tradeoff in terms of performance and simplicity.
 
+    Optimized to batch async broadcasts with CUDA streams for better performance.
+
     Args:
         loaded_tensors (Dict[_ShardId, torch.Tensor]): mapping from ShardedTensor
             shard ids to tensors already loaded by this rank.
@@ -460,6 +462,12 @@ def exchange_loaded_tensors_broadcast(
 
     all_loaded_tensors = dict(loaded_tensors)
 
+    # Batch size for async operations (tune this based on memory constraints)
+    # Larger batches reduce synchronization overhead
+    ASYNC_BATCH_SIZE = 32
+    
+    # Collect all broadcasts to perform
+    broadcasts_to_perform = []
     for idx, (shard_id, rank) in enumerate(main_rank_for_shard.items()):
         if len(all_ranks_for_shard[shard_id]) == 1:
             assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
@@ -469,47 +477,128 @@ def exchange_loaded_tensors_broadcast(
                 f' vs loads [{main_rank_for_shard[shard_id]}]'
             )
             # Skipping the exchange since only the loading rank needs this tensor
-            # TODO: we can employ some optimizations even for `len(shard_to_ranks) > 1` case,
-            #  e.g. P2P exchange. Currently handling this case saves most of the work though.
             continue
-        if rank == local_rank:
-            assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
-            orig_device = all_loaded_tensors[shard_id].device
-            local_ten = all_loaded_tensors[shard_id].cuda()
-        else:
-            local_ten, orig_device = _get_empty_tensor_for_exchange(
-                shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
+        
+        broadcasts_to_perform.append((shard_id, rank))
+    
+    # Create CUDA streams for overlapping operations
+    num_streams = min(4, len(broadcasts_to_perform))
+    streams = [torch.cuda.Stream() for _ in range(num_streams)] if torch.cuda.is_available() else []
+    
+    # Process broadcasts in batches for async operations
+    for batch_start in range(0, len(broadcasts_to_perform), ASYNC_BATCH_SIZE):
+        batch_end = min(batch_start + ASYNC_BATCH_SIZE, len(broadcasts_to_perform))
+        batch = broadcasts_to_perform[batch_start:batch_end]
+        
+        # Prepare tensors for this batch
+        batch_tensors = []
+        batch_metadata = []  # (shard_id, orig_device, needs_cpu_copy)
+        
+        # Use streams to overlap H2D copies
+        for idx, (shard_id, rank) in enumerate(batch):
+            stream_idx = idx % len(streams) if streams else 0
+            
+            if streams:
+                with torch.cuda.stream(streams[stream_idx]):
+                    tensor, orig_device, needs_copy = _prepare_tensor_for_broadcast(
+                        shard_id, rank, local_rank, all_loaded_tensors,
+                        unloaded_shards, shard_to_metadata
+                    )
+            else:
+                tensor, orig_device, needs_copy = _prepare_tensor_for_broadcast(
+                    shard_id, rank, local_rank, all_loaded_tensors,
+                    unloaded_shards, shard_to_metadata
+                )
+            
+            batch_tensors.append(tensor)
+            batch_metadata.append((shard_id, orig_device, needs_copy))
+        
+        # Synchronize all streams before broadcasts
+        if streams:
+            for stream in streams:
+                stream.synchronize()
+        
+        # Launch all broadcasts in this batch asynchronously
+        pending_ops = []
+        for i, (shard_id, rank) in enumerate(batch):
+            global_src_rank = (
+                rank
+                if parallelization_group == None
+                else torch.distributed.get_global_rank(parallelization_group, rank)
             )
-
-        # Because of a TE bug, we have to exchange a nominal dtype instead of FP8
-        # It's ok to keep the nominal dtype after exchange, because TE will handle
-        # this during state dict load.
-        # TODO: remove it once the bug is fixed
-        if is_float8tensor(local_ten):
-            try:
-                local_ten = local_ten.from_float8()
-            except Exception as e:
-                local_ten = local_ten.dequantize()
-            all_loaded_tensors[shard_id] = local_ten
-
-        global_src_rank = (
-            rank
-            if parallelization_group == None
-            else torch.distributed.get_global_rank(parallelization_group, rank)
-        )
-        # We can do async_op=True only if there is no CPU-copy follow-up
-        torch.distributed.broadcast(
-            local_ten,
-            src=global_src_rank,
-            group=parallelization_group,
-            async_op=orig_device is None,
-        )
-        # Move tensor back to CPU if originally was on CPU
-        if orig_device is not None:
-            all_loaded_tensors[shard_id] = local_ten.to(orig_device)
-        del local_ten
+            
+            # Launch broadcast with async_op=True
+            work = torch.distributed.broadcast(
+                batch_tensors[i],
+                src=global_src_rank,
+                group=parallelization_group,
+                async_op=True,
+            )
+            pending_ops.append((work, i))
+        
+        # Wait for all broadcasts in this batch to complete
+        for work, idx in pending_ops:
+            work.wait()
+        
+        # Post-process: move tensors back to CPU if needed using streams
+        for i, (shard_id, orig_device, needs_cpu_copy) in enumerate(batch_metadata):
+            stream_idx = i % len(streams) if streams else 0
+            
+            if needs_cpu_copy:
+                if streams:
+                    with torch.cuda.stream(streams[stream_idx]):
+                        all_loaded_tensors[shard_id] = batch_tensors[i].to(orig_device, non_blocking=True)
+                else:
+                    all_loaded_tensors[shard_id] = batch_tensors[i].to(orig_device)
+            del batch_tensors[i]
+        
+        # Synchronize streams after D2H copies
+        if streams:
+            for stream in streams:
+                stream.synchronize()
+        
+        del batch_tensors
+        del batch_metadata
+        del pending_ops
 
     return all_loaded_tensors
+
+
+def _prepare_tensor_for_broadcast(
+    shard_id: _ShardId,
+    rank: int,
+    local_rank: int,
+    all_loaded_tensors: Dict[_ShardId, torch.Tensor],
+    unloaded_shards: Dict[_ShardId, ShardedTensor],
+    shard_to_metadata: Dict[_ShardId, ShardedTensor],
+) -> Tuple[torch.Tensor, Optional[torch.device], bool]:
+    """Prepare a tensor for broadcast operation.
+    
+    Returns:
+        Tuple of (tensor on GPU, original device, needs CPU copy after broadcast)
+    """
+    if rank == local_rank:
+        assert shard_id in all_loaded_tensors, (shard_id, all_loaded_tensors.keys())
+        orig_device = all_loaded_tensors[shard_id].device
+        local_ten = all_loaded_tensors[shard_id].cuda()
+    else:
+        local_ten, orig_device = _get_empty_tensor_for_exchange(
+            shard_id, unloaded_shards, shard_to_metadata, all_loaded_tensors
+        )
+
+    # Because of a TE bug, we have to exchange a nominal dtype instead of FP8
+    # It's ok to keep the nominal dtype after exchange, because TE will handle
+    # this during state dict load.
+    # TODO: remove it once the bug is fixed
+    if is_float8tensor(local_ten):
+        try:
+            local_ten = local_ten.from_float8()
+        except Exception as e:
+            local_ten = local_ten.dequantize()
+        all_loaded_tensors[shard_id] = local_ten
+
+    needs_cpu_copy = orig_device is not None
+    return local_ten, orig_device, needs_cpu_copy
 
 
 def exchange_by_distribution(
